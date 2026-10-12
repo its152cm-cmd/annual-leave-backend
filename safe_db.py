@@ -25,11 +25,14 @@ class SafeBuilder:
 
     def execute(self, *args, **kwargs):
         method = str(getattr(getattr(self._inner, "request", None), "http_method", "") or "").upper()
-        tries = 3 if method in RETRY_METHODS else 1
+        tries = 3 if method in RETRY_METHODS else 2
         for attempt in range(tries):
             try:
                 return self._inner.execute(*args, **kwargs)
             except TRANSIENT as e:
+                # a write is only repeated when the connection was already closed (nothing reached the database)
+                if method not in RETRY_METHODS and not isinstance(e, httpx.RemoteProtocolError):
+                    raise
                 if attempt == tries - 1:
                     raise
                 print(f"[db] network hiccup ({type(e).__name__}); trying again")
