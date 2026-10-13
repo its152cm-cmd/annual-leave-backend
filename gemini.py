@@ -188,7 +188,7 @@ def _try_model(model: str, prompt: str, schema: dict | None, temperature: float,
 def generate_json(prompt: str, schema: dict | None = None, temperature: float = 0.7, timeout: float = 170.0, fast: bool = False, image: tuple | None = None, max_tokens: int | None = None):
     """Asks Gemini for a JSON answer and returns it already parsed.
 
-    fast=True tries the lightweight model first (for short answers).
+    The lightest model is always tried first, then the heavier ones as backup.
 
     If one model is overloaded (503), over its limit (429) or gone (404), the
     next model on the list is tried before giving up.
@@ -196,13 +196,14 @@ def generate_json(prompt: str, schema: dict | None = None, temperature: float = 
     global _model_list, _model_cache
     last_error: GeminiError | None = None
     models = candidate_models()
-    if fast:  # short answers: the lighter model is quicker, the others are the backup
-        models = sorted(models, key=lambda m: "lite" not in m)
+    # Always the lightest model first (quicker, and the heavier ones are often overloaded); the others are the backup.
+    models = sorted(models, key=lambda m: "lite" not in m)
     for model in models:
         try:
             return _try_model(model, prompt, schema, temperature, timeout, image, max_tokens)
         except GeminiError as e:
-            if e.status not in (429, 503, 404):
+            unreadable = e.status == 502 and bool(e.raw_text)  # answered, but not valid JSON: another model may do better
+            if e.status not in (429, 503, 404) and not unreadable:
                 raise
             if e.status == 404:
                 _model_list = _model_cache = None  # look the list up again next time
