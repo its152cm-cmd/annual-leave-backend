@@ -1,0 +1,1 @@
+enum PanelState { hidden, peek, expanded }
