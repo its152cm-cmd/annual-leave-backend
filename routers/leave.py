@@ -298,6 +298,8 @@ def compute_combos(
                 "return_multiplier": ratio_text,
                 "leave_days_used": len(used),
                 "date_range": f"{_label(start)} - {_label(end)}",
+                "start_date": key(start),
+                "end_date": key(end),
                 "description": desc,
             }
         )
