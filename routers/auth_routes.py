@@ -22,13 +22,33 @@ def _fresh_client():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SECRET_KEY"))
 
 
+def _email_registered(email: str) -> bool:
+    """True when an account with this email exists in Supabase Auth."""
+    try:
+        for page in range(1, 11):  # up to 10,000 accounts; plenty for this app
+            users = supabase.auth.admin.list_users(page=page, per_page=1000) or []
+            if any(str(getattr(u, "email", "") or "").lower() == email for u in users):
+                return True
+            if len(users) < 1000:
+                return False
+        return False
+    except Exception:
+        # fall back to the profiles table if the admin listing is unavailable
+        try:
+            return bool(supabase.table("profiles").select("id").eq("email", email).execute().data)
+        except Exception:
+            return True  # cannot tell: treat as registered so the message stays "wrong password"
+
+
 def _password_login(email: str, password: str) -> dict:
     try:
         res = _fresh_client().auth.sign_in_with_password({"email": email, "password": password})
     except Exception:
-        raise HTTPException(status_code=401, detail="Wrong email or password")
+        res = None
     if not res or not res.session or not res.user:
-        raise HTTPException(status_code=401, detail="Wrong email or password")
+        if not _email_registered(email):
+            raise HTTPException(status_code=404, detail="No account is registered with this email. Please create an account first.")
+        raise HTTPException(status_code=401, detail="Wrong password. Please try again.")
     return {"token": res.session.access_token, "refreshToken": res.session.refresh_token, "userId": str(res.user.id)}
 
 
@@ -102,3 +122,4 @@ def signup(body: SignupIn):
 @router.post("/refresh")
 def refresh(body: RefreshIn):
     return _session_json(_refresh(body.refreshToken))
+

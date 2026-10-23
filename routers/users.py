@@ -144,7 +144,7 @@ class Notifications(BaseModel):
 class Comfort(BaseModel):
     model_config = ConfigDict(extra="ignore")
     max_walking_minutes: int | None = Field(default=None, ge=5, le=30)
-    max_activities_per_day: int | None = Field(default=None, ge=1, le=10)
+    max_activities_per_day: int | None = Field(default=None, ge=1, le=6)
     rest_break_frequency: int | None = Field(default=None, ge=1, le=3)
     accessible_transport_only: bool | None = None
     nearby_restrooms_priority: bool | None = None

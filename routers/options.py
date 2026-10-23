@@ -1078,6 +1078,8 @@ def _describe_schema() -> dict:
             "highlights": {"type": "ARRAY", "items": s},
             "best_for": s,
             "tip": s,
+            "price_info": s,
+            "rating_info": s,
         },
         "required": ["summary", "highlights"],
     }
@@ -1106,10 +1108,12 @@ Known facts: {extra or 'none'}
 
 RULES
 - Write like a travel guide, in the third person. NEVER write "I", "I do not recognise", "I am not sure", "as an AI" or any sentence about what you know or do not know.
-- If you are not certain about this exact place, describe in general terms what a place of that type and name usually offers in {city} and in the area, using wording such as "usually", "typically" or "popular for". Never invent awards, ratings, prices, review quotes or opening hours.
+- If you are not certain about this exact place, describe in general terms what a place of that type and name usually offers in {city} and in the area, using wording such as "usually", "typically" or "popular for". Never invent awards, review quotes or opening hours.
+- price_info: the typical cost as far as you know it from what is published online: the entry fee for a place to visit (or "Free"), the usual price per person for a meal, or the usual price per night for a room. Give an approximate range in the local currency with the approximate Malaysian Ringgit in brackets, e.g. "About ¥1,000-1,500 per person (about RM 30-45)". If you do not know, return an empty string. Do not guess wildly.
+- rating_info: the usual public review score (for example on Google Maps or travel sites) ONLY if you know it, e.g. "Usually rated about 4.5 out of 5". If you do not know, return an empty string.
 - summary: 2-3 plain sentences. highlights: 3-4 short phrases (what to see, try or expect). best_for: one short phrase (e.g. "Families, history lovers"). tip: one practical tip (best time, how to get there, booking).
 
-Answer with JSON only: {{"summary": "...", "highlights": ["..."], "best_for": "...", "tip": "..."}}"""
+Answer with JSON only: {{"summary": "...", "highlights": ["..."], "best_for": "...", "tip": "...", "price_info": "...", "rating_info": "..."}}"""
 
 
 def maps_url(name: str, city: str) -> str:
@@ -1124,7 +1128,7 @@ def describe(name: str, city: str, kind: str = "attraction", extra: str = "", me
         raise HTTPException(status_code=422, detail="name and city are required")
     if kind not in KINDS - {"flight"}:
         raise HTTPException(status_code=422, detail="kind must be attraction, hotel or food")
-    key = ("describe", name.lower(), city.lower(), kind)
+    key = ("describe2", name.lower(), city.lower(), kind)
     result = _cached(key)
     if result is None:
         try:
@@ -1141,5 +1145,7 @@ def describe(name: str, city: str, kind: str = "attraction", extra: str = "", me
             "highlights": highlights,
             "best_for": _clean_text(raw.get("best_for")),
             "tip": _clean_text(raw.get("tip")),
+            "price_info": _clean_text(raw.get("price_info"))[:160],
+            "rating_info": _clean_text(raw.get("rating_info"))[:120],
         })
     return {**result, "maps_url": maps_url(name, city)}

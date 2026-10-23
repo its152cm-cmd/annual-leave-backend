@@ -8,7 +8,7 @@ DEFAULTS = {
     "max_walking_minutes": 15, "max_activities_per_day": 3, "rest_break_frequency": 1,
     "accessible_transport_only": True, "nearby_restrooms_priority": True, "minimize_stairs": False,
 }
-INT_RANGES = {"max_walking_minutes": (5, 30), "max_activities_per_day": (1, 10), "rest_break_frequency": (1, 3)}
+INT_RANGES = {"max_walking_minutes": (5, 30), "max_activities_per_day": (1, 6), "rest_break_frequency": (1, 3)}
 BOOLS = ("accessible_transport_only", "nearby_restrooms_priority", "minimize_stairs")
 
 
@@ -43,7 +43,10 @@ def effective(uid: str, trip_id: str | None = None) -> dict:
     for k in DEFAULTS:
         if acct.get(k) is not None:
             base[k] = acct[k]
-    return {**base, **(own or {})}
+    out = {**base, **(own or {})}
+    lo, hi = INT_RANGES["max_activities_per_day"]  # older saved values above the limit are pulled in
+    out["max_activities_per_day"] = max(lo, min(hi, int(out["max_activities_per_day"])))
+    return out
 
 
 def strictest(rows: list[dict]) -> dict:
