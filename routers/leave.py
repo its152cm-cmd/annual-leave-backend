@@ -116,7 +116,7 @@ def public_holidays(year: int) -> dict[str, str]:
     return data
 
 
-def _balance(user_id: str, year: int) -> int:
+def _stored_balance(user_id: str, year: int) -> int:
     rows = (
         supabase.table("leave_balances")
         .select("leave_balance")
@@ -126,6 +126,57 @@ def _balance(user_id: str, year: int) -> int:
         .data
     )
     return rows[0]["leave_balance"] if rows else DEFAULT_BALANCE
+
+
+def _trip_days(user_id: str) -> set[str]:
+    """Every day of every confirmed (or finished) trip this person has accepted.
+
+    Individual on purpose: each traveller's own calendar and leave balance follow
+    the trips they are on. Deleting a trip frees its days again automatically.
+    """
+    ids = accepted_trip_ids(user_id)
+    if not ids:
+        return set()
+    rows = (
+        supabase.table("trips")
+        .select("start_date,end_date,status")
+        .in_("id", ids)
+        .in_("status", ["upcoming", "completed"])
+        .execute()
+        .data
+    )
+    days: set[str] = set()
+    for r in rows:
+        start, end = parse_date(r.get("start_date")), parse_date(r.get("end_date"))
+        if not start or not end or end < start or (end - start).days > 400:
+            continue
+        for i in range((end - start).days + 1):
+            days.add((start + timedelta(days=i)).isoformat())
+    return days
+
+
+def _trip_leave_used(user_id: str, year: int) -> int:
+    """Working days inside the person's confirmed trips that cost one leave day each.
+
+    Weekends, public holidays and days they already tagged "Leave taken" are free.
+    """
+    prefix = f"{year}-"
+    mine = {d for d in _trip_days(user_id) if d.startswith(prefix)}
+    if not mine:
+        return 0
+    holidays = public_holidays(year)
+    stored = _stored_statuses(user_id, year)
+    used = 0
+    for d in mine:
+        if parse_date(d).weekday() >= 5 or d in holidays or stored.get(d) == "annual_leave":
+            continue
+        used += 1
+    return used
+
+
+def _balance(user_id: str, year: int) -> int:
+    """Leave days still free = what the person set, minus what their trips use."""
+    return max(0, _stored_balance(user_id, year) - _trip_leave_used(user_id, year))
 
 
 def _stored_statuses(user_id: str, year: int) -> dict[str, str]:
@@ -145,6 +196,8 @@ def _statuses(user_id: str, year: int) -> dict[str, str]:
     """Public holidays first, then the user's own marks on top."""
     result = {d: "holiday" for d in public_holidays(year)}
     result.update({d: s for d, s in _stored_statuses(user_id, year).items() if s != "normal"})
+    # days of a confirmed trip show as "trip" and are never offered again
+    result.update({d: "trip" for d in _trip_days(user_id) if d.startswith(f"{year}-")})
     return result
 
 
@@ -209,8 +262,10 @@ class BalanceIn(BaseModel):
 def set_balance(body: BalanceIn, me: str = Depends(get_current_user_id)):
     """LeaveService.updateLeaveBalance."""
     year = body.year or date.today().year
+    # the person types the days they have LEFT; trips already take their share
+    stored = min(365, body.leave_balance + _trip_leave_used(me, year))
     supabase.table("leave_balances").upsert(
-        {"user_id": me, "year": year, "leave_balance": body.leave_balance},
+        {"user_id": me, "year": year, "leave_balance": stored},
         on_conflict="user_id,year",
     ).execute()
     return {"ok": True, "leave_balance": body.leave_balance}
@@ -250,7 +305,7 @@ def compute_combos(
         return d.weekday() >= 5 or holiday(d) or statuses.get(key(d)) == "annual_leave"
 
     def busy(d: date) -> bool:
-        return statuses.get(key(d)) == "busy"
+        return statuses.get(key(d)) in ("busy", "trip")
 
     candidates = []
     start = first - timedelta(days=9)
@@ -358,7 +413,7 @@ def compute_group_windows(
         return d.weekday() >= 5 or key(d) in holiday_names or m["statuses"].get(key(d)) in ("holiday", "annual_leave")
 
     def busy(m: dict, d: date) -> bool:
-        return m["statuses"].get(key(d)) == "busy"
+        return m["statuses"].get(key(d)) in ("busy", "trip")
 
     candidates = []
     first = today + timedelta(days=1)
@@ -440,7 +495,7 @@ def check_group_range(members, holiday_names, start: date, end: date, balance_fo
     people, problems = [], []
     for m in members:
         st = m["statuses"]
-        busy_days = [d.isoformat() for d in days if st.get(d.isoformat()) == "busy"]
+        busy_days = [d.isoformat() for d in days if st.get(d.isoformat()) in ("busy", "trip")]
         needed = sum(
             1
             for d in days
@@ -487,7 +542,7 @@ def group_dates(trip_id: str, length: int | None = None, me: str = Depends(get_c
     members, names, today, balance_for = _group_context(trip_id, me)
     options = compute_group_windows(members, names, today, balance_for, exact_len=length)
     busy_counts = [
-        {"id": m["id"], "name": m["name"], "busy_days": sum(1 for d, s in m["statuses"].items() if s == "busy" and d >= today.isoformat())}
+        {"id": m["id"], "name": m["name"], "busy_days": sum(1 for d, s in m["statuses"].items() if s in ("busy", "trip") and d >= today.isoformat())}
         for m in members
     ]
     reason = ""
