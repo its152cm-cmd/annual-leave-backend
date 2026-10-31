@@ -25,20 +25,27 @@ def _display_code(profile: dict) -> str:
 
 def _profile_json(profile: dict) -> dict:
     """AccountProfile JSON (lib/models/account_profile.dart)."""
-    completed = 0
+    done: list[dict] = []
     ids = accepted_trip_ids(profile["id"])
     if ids:
-        completed = len(
-            supabase.table("trips").select("id").in_("id", ids).eq("status", "completed").execute().data
-        )
+        done = supabase.table("trips").select("*").in_("id", ids).eq("status", "completed").execute().data
+    completed = len(done)
+    from routers.trips import trip_places  # local import: trips imports this package too
+    countries, cities, km = set(), set(), 0.0
+    for t in done:
+        cs, country = trip_places(t)
+        cities.update((c.lower(), country.lower()) for c in cs)
+        if country:
+            countries.add(country.lower())
+        km += float(t.get("distance_km") or 0)
     return {
         "name": display_name(profile),
         "user_id": _display_code(profile),
         "avatar_url": profile.get("avatar_url") or "",
-        "countries_visited": profile.get("countries_visited") or 0,
-        "cities_explored": profile.get("cities_explored") or 0,
+        "countries_visited": (profile.get("countries_visited") or 0) + len(countries),
+        "cities_explored": (profile.get("cities_explored") or 0) + len(cities),
         "trips_completed": completed,
-        "distance_travelled_km": profile.get("distance_travelled_km") or 0,
+        "distance_travelled_km": round((profile.get("distance_travelled_km") or 0) + km),
         # extras the Flutter model ignores
         "id": profile["id"],
         "email": profile.get("email") or "",

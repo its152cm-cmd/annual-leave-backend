@@ -4,6 +4,7 @@ Lines start from the itinerary and the AI budget breakdown, then the host can ed
 and attach booking documents. Gemini reads each document and the backend checks it against the trip dates."""
 import base64
 import binascii
+import math
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+import estimates
 import gemini
 from auth import get_current_user_id
 from database import supabase
@@ -104,7 +106,7 @@ def _itinerary_items(trip_id: str) -> list[dict]:
     its = supabase.table("itineraries").select("id").eq("trip_id", trip_id).execute().data
     if not its:
         return []
-    days = supabase.table("itinerary_days").select("id,day_number").eq("itinerary_id", its[0]["id"]).execute().data
+    days = supabase.table("itinerary_days").select("id,day_number,location").eq("itinerary_id", its[0]["id"]).execute().data
     days.sort(key=lambda d: d["day_number"])
     out = []
     for d in days:
@@ -112,7 +114,7 @@ def _itinerary_items(trip_id: str) -> list[dict]:
         rows.sort(key=lambda r: r.get("position") or 0)
         for r in rows:
             out.append({"key": str((r.get("source_data") or {}).get("client_id") or r["id"]), "title": r.get("title") or "",
-                        "type": r.get("type") or "", "booking_url": r.get("booking_url") or ""})
+                        "type": r.get("type") or "", "booking_url": r.get("booking_url") or "", "city": (d.get("location") or "").strip(), "day": d["day_number"]})
     return out
 
 
@@ -125,11 +127,78 @@ def _seed(trip_id: str, trip: dict) -> None:
     booked = set(trip.get("booked_item_ids") or [])
     rows = []
     for pos, ln in enumerate(build_lines(trip, items)):
-        rows.append({"trip_id": trip_id, "item_key": ln.get("item_key"), "category": ln["category"], "title": ln["title"][:140],
+        ln["auto"] = "hotel" if ln["category"] == "Accommodation" and ln.get("item_key") else "activities" if ln["title"] == "Activities and tickets" else ""
+        rows.append({"auto": ln["auto"], "trip_id": trip_id, "item_key": ln.get("item_key"), "category": ln["category"], "title": ln["title"][:140],
                      "amount": round(float(ln["amount"]), 2), "booking_url": ln.get("booking_url", ""), "position": pos,
                      "status": "booked" if ln.get("item_key") in booked else "estimated"})
     supabase.table("trip_budget_lines").insert(rows).execute()
     supabase.table("trip_budget_seed").upsert({"trip_id": trip_id}, on_conflict="trip_id").execute()
+
+
+# ---------------------------------------------------------------- estimated prices
+def _people(trip: dict) -> int:
+    return max(1, int(trip.get("traveller_count") or 1))
+
+
+def estimated_amounts(trip: dict, items: list[dict], day_count: int = 0) -> tuple[dict[str, float], float | None]:
+    """({hotel item key: cost of the stay}, activities total) from Gemini's price estimates for what is in the itinerary.
+    Hotel: price per room-night x nights x rooms. Activities: entry fee per person x travellers. Unknown prices are left out."""
+    people = _people(trip)
+    rooms = math.ceil(people / 2)
+    days = day_count or len({i.get("day") for i in items if i.get("day") is not None}) or 1
+    nights = max(1, days - 1)
+    default_city = (trip.get("destination") or "").split(",")[0].strip()
+
+    hotels, seen = [], set()
+    for h in (i for i in items if i["type"] == "hotel"):
+        name = _hotel_name(h["title"])
+        if name.lower() not in seen:
+            seen.add(name.lower()); hotels.append({**h, "title": name})
+    stay: dict[str, float] = {}
+    if hotels:
+        by_city: dict[str, list[str]] = {}
+        for h in hotels:
+            by_city.setdefault(h.get("city") or default_city, []).append(h["title"])
+        price: dict[tuple, float] = {}
+        for city, names in by_city.items():
+            for n, v in estimates.estimate("hotel", city, names).items():
+                price[(city, n)] = v
+        for h in hotels:
+            v = price.get((h.get("city") or default_city, h["title"]))
+            if v:
+                stay[h["key"]] = round(v * rooms * nights / len(hotels), 2)
+
+    acts = [i for i in items if i["type"] == "attraction"]
+    total: float | None = None
+    if acts:
+        by_city = {}
+        for a in acts:
+            by_city.setdefault(a.get("city") or default_city, []).append(a["title"])
+        known = {}
+        for city, names in by_city.items():
+            for n, v in estimates.estimate("attraction", city, names).items():
+                known[(city, n)] = v
+        if known:
+            total = round(sum(known.get((a.get("city") or default_city, a["title"]), 0.0) for a in acts) * people, 2)
+    return stay, total
+
+
+def _sync_estimates(trip_id: str, trip: dict) -> None:
+    """Keeps lines that follow the itinerary (auto) in step with the chosen hotel and attractions. Edited or booked lines are left alone."""
+    lines = supabase.table("trip_budget_lines").select("*").eq("trip_id", trip_id).execute().data
+    auto = [l for l in lines if l.get("auto") in ("hotel", "activities") and l.get("status") == "estimated"]
+    if not auto:
+        return
+    items = _itinerary_items(trip_id)
+    if not items:
+        return
+    its = supabase.table("itineraries").select("id").eq("trip_id", trip_id).execute().data
+    day_count = len(supabase.table("itinerary_days").select("id").eq("itinerary_id", its[0]["id"]).execute().data) if its else 0
+    stay, acts = estimated_amounts(trip, items, day_count)
+    for l in auto:
+        new = stay.get(l.get("item_key")) if l["auto"] == "hotel" else acts
+        if new is not None and abs(float(l.get("amount") or 0) - new) > 0.01:
+            supabase.table("trip_budget_lines").update({"amount": new, "updated_at": _now()}).eq("id", l["id"]).execute()
 
 
 # ---------------------------------------------------------------- json
@@ -166,6 +235,10 @@ def _all(trip_id: str) -> tuple[list[dict], list[dict]]:
 def list_lines(trip_id: str, me: str = Depends(get_current_user_id)):
     trip_id, trip, is_host = _ctx(trip_id, me)
     _seed(trip_id, trip)
+    try:
+        _sync_estimates(trip_id, trip)
+    except Exception as e:  # the list must still load if the estimate step fails
+        print(f"[budget] estimate sync skipped: {e}")
     lines, docs = _all(trip_id)
     return {"canEdit": is_host, "lines": [_line_json(l, docs) for l in lines], "summary": summary(trip, lines)}
 
@@ -226,7 +299,7 @@ def edit_line(trip_id: str, line_id: str, body: LinePatch, me: str = Depends(get
     patch: dict = {"updated_at": _now()}
     if body.category is not None: patch["category"] = _canon(body.category)
     if body.title is not None: patch["title"] = " ".join(body.title.split())
-    if body.amount is not None: patch["amount"] = round(body.amount, 2)
+    if body.amount is not None: patch["amount"] = round(body.amount, 2); patch["auto"] = ""
     if body.status is not None: patch["status"] = _check_status(body.status)
     if body.bookingUrl is not None: patch["booking_url"] = _url(body.bookingUrl)
     supabase.table("trip_budget_lines").update(patch).eq("id", line_id).execute()

@@ -1,3 +1,5 @@
+import math
+import re
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,6 +42,7 @@ class TripIn(BaseModel):
     image_url: str = ""
     status: str | None = None
     generated_from_group_chat: bool = False
+    itinerary_first: bool = False
     traveller_count: int = Field(default=1, ge=1)
     minimum_budget: float | None = None
     planned_budget: float | None = None
@@ -68,6 +71,7 @@ def trip_json(t: dict, collaborators: list[dict] | None = None) -> dict:
         "image_url": t.get("image_url") or "",
         "status": t["status"],
         "generated_from_group_chat": t.get("generated_from_group_chat", False),
+        "itinerary_first": t.get("itinerary_first", False),
         "traveller_count": t.get("traveller_count") or 1,
         "minimum_budget": float(low if low is not None else (high or 0)),
         "planned_budget": float(high if high is not None else (low or 0)),
@@ -135,6 +139,7 @@ def _row_from_body(body: TripIn) -> dict:
         "image_url": body.image_url,
         "traveller_count": body.traveller_count,
         "generated_from_group_chat": body.generated_from_group_chat,
+        "itinerary_first": body.itinerary_first,
         "origin_city": body.origin_city,
         "estimated_budget": body.estimated_budget,
         "budget_breakdown": body.budget_breakdown,
@@ -149,10 +154,12 @@ def _invite_collaborators(trip_id: str, collaborators: list[dict]) -> bool:
     if not wanted:
         return False
     known = fetch_profiles(wanted)
-    existing = {
-        r["user_id"]
-        for r in supabase.table("trip_members").select("user_id").eq("trip_id", trip_id).execute().data
-    }
+    rows = supabase.table("trip_members").select("user_id,status").eq("trip_id", trip_id).execute().data
+    existing = {r["user_id"] for r in rows}
+    # Someone who declined earlier is invited again (their old row is reused).
+    declined = [r["user_id"] for r in rows if r.get("status") == "declined" and r["user_id"] in known]
+    for uid in declined:
+        supabase.table("trip_members").update({"status": "invited"}).eq("trip_id", trip_id).eq("user_id", uid).execute()
     new_rows = [
         {"trip_id": trip_id, "user_id": uid, "role": "Member", "status": "invited"}
         for uid in known
@@ -160,7 +167,8 @@ def _invite_collaborators(trip_id: str, collaborators: list[dict]) -> bool:
     ]
     if new_rows:
         supabase.table("trip_members").insert(new_rows).execute()
-        _push_invites(trip_id, [r["user_id"] for r in new_rows])
+    if new_rows or declined:
+        _push_invites(trip_id, [r["user_id"] for r in new_rows] + declined)
     return True
 
 
@@ -210,7 +218,28 @@ def _save_trip(body: TripIn, me: str, new_status: str) -> dict:
         ).execute()
 
     _invite_collaborators(trip_id, body.collaborators)
+    if new_status == "upcoming":
+        _retire_duplicate_drafts(trip_id, me)
     return _load_trip(trip_id, me)
+
+
+def _trip_key(t: dict) -> tuple:
+    return ((t.get("destination") or "").strip().lower(), str(t.get("start_date") or ""), str(t.get("end_date") or ""))
+
+
+def _is_plain_draft(t: dict, me: str) -> bool:
+    return t.get("status") == "draft" and t.get("host_id") == me and t.get("trip_type") != "group"
+
+
+def _retire_duplicate_drafts(trip_id: str, me: str) -> None:
+    """A trip just became upcoming: the host's leftover solo draft of the very same trip (same place and dates) is removed."""
+    rows = supabase.table("trips").select("*").eq("host_id", me).execute().data
+    mine = next((r for r in rows if r["id"] == trip_id), None)
+    if not mine or not mine.get("start_date"):
+        return
+    for r in rows:
+        if r["id"] != trip_id and _is_plain_draft(r, me) and _trip_key(r) == _trip_key(mine):
+            supabase.table("trips").delete().eq("id", r["id"]).execute()
 
 
 # ---------- endpoints ----------------------------------------------------
@@ -221,6 +250,9 @@ def list_trips(user_id: str = Depends(get_current_user_id)):
     if not ids:
         return []
     trips = supabase.table("trips").select("*").in_("id", ids).order("created_at", desc=True).execute().data
+    # a leftover solo draft of a trip that is already confirmed is not listed twice
+    done = {_trip_key(t) for t in trips if t.get("status") in ("upcoming", "completed") and t.get("start_date")}
+    trips = [t for t in trips if not (_is_plain_draft(t, user_id) and _trip_key(t) in done)]
     collabs = _collaborators_by_trip([t["id"] for t in trips], user_id)
     return [trip_json(t, collabs[t["id"]]) for t in trips]
 
@@ -282,6 +314,60 @@ def delete_trip(trip_id: str, user_id: str = Depends(get_current_user_id)):
     return {"ok": True}
 
 
+def trip_places(trip: dict) -> tuple[list[str], str]:
+    """(cities in order, country) from a destination such as 'Tokyo → Kyoto → Osaka, Japan' or 'Penang, Malaysia'."""
+    dest = (trip.get("destination") or "").strip()
+    country = ""
+    if "," in dest:
+        dest, country = dest.rsplit(",", 1)
+        country = country.strip()
+    cities = [c.strip() for c in re.split(r"→|->", dest) if c.strip()]
+    return cities, country
+
+
+def _km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance between two (lon, lat) points."""
+    (lo1, la1), (lo2, la2) = a, b
+    p1, p2 = math.radians(la1), math.radians(la2)
+    h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+
+def trip_distance_km(trip: dict) -> int:
+    """Round trip: home -> each city in order -> home. 0 if a place cannot be found."""
+    from routers.options import geocode  # imported here: options is a big module
+    cities, country = trip_places(trip)
+    home = (trip.get("origin_city") or "Kuala Lumpur").strip()
+    try:
+        stops = [geocode(home)] + [geocode(f"{c}, {country}" if country else c) for c in cities]
+    except HTTPException as e:
+        print(f"[trips] distance unavailable: {e.detail}")
+        return 0
+    if len(stops) < 2:
+        return 0
+    stops.append(stops[0])
+    return round(sum(_km(a, b) for a, b in zip(stops, stops[1:])))
+
+
+@router.post("/{trip_id}/complete")
+def complete_trip(trip_id: str, user_id: str = Depends(get_current_user_id)):
+    """The trip is over: upcoming -> completed, for everyone on it. Only the host can. Feeds the account statistics."""
+    trip_id = require_uuid(trip_id, "trip id")
+    rows = supabase.table("trips").select("*").eq("id", trip_id).execute().data
+    if not rows:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    require_accepted_member(trip_id, user_id)
+    trip = rows[0]
+    if trip["host_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can mark the trip as completed")
+    if trip["status"] == "completed":
+        return _load_trip(trip_id, user_id)
+    if trip["status"] != "upcoming":
+        raise HTTPException(status_code=409, detail="Only a confirmed (upcoming) trip can be marked as completed")
+    supabase.table("trips").update({"status": "completed", "distance_km": trip_distance_km(trip)}).eq("id", trip_id).execute()
+    return _load_trip(trip_id, user_id)
+
+
 @router.put("/{trip_id}/booked-items")
 def save_booked_items(trip_id: str, body: BookedItemsIn, user_id: str = Depends(get_current_user_id)):
     """TripService.saveBookedItemIds."""
@@ -325,6 +411,51 @@ class DetailsIn(BaseModel):
     date_range: str | None = None
     budget_min: float | None = Field(default=None, ge=0, le=10_000_000)
     budget_max: float | None = Field(default=None, ge=0, le=10_000_000)
+
+
+class ShiftIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    start_date: date
+
+
+@router.put("/{trip_id}/dates")
+def move_trip_dates(trip_id: str, body: ShiftIn, user_id: str = Depends(get_current_user_id)):
+    """The host moves the whole trip to start on another date (same length).
+
+    Works for confirmed trips too: every itinerary day moves with it, and each
+    traveller's leave calendar follows because it is worked out from the trip.
+    """
+    trip_id = require_uuid(trip_id, "trip id")
+    require_accepted_member(trip_id, user_id)
+    rows = supabase.table("trips").select("host_id,start_date,end_date").eq("id", trip_id).execute().data
+    if not rows:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    if rows[0]["host_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can change the travel dates")
+    old_start, old_end = parse_date(rows[0].get("start_date")), parse_date(rows[0].get("end_date"))
+    if not old_start or not old_end or old_end < old_start:
+        raise HTTPException(status_code=409, detail="This trip has no dates to move yet")
+    if body.start_date < date.today():
+        raise HTTPException(status_code=422, detail="That date has already passed")
+    delta = body.start_date - old_start
+    supabase.table("trips").update(
+        {"start_date": body.start_date.isoformat(), "end_date": (old_end + delta).isoformat()}
+    ).eq("id", trip_id).execute()
+    if delta.days:
+        its = supabase.table("itineraries").select("id").eq("trip_id", trip_id).execute().data
+        if its:
+            days = (
+                supabase.table("itinerary_days")
+                .select("id,day_date")
+                .in_("itinerary_id", [i["id"] for i in its])
+                .execute()
+                .data
+            )
+            for d in days:
+                day = parse_date(d.get("day_date"))
+                if day:
+                    supabase.table("itinerary_days").update({"day_date": (day + delta).isoformat()}).eq("id", d["id"]).execute()
+    return _load_trip(trip_id, user_id)
 
 
 @router.patch("/{trip_id}/details")

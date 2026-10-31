@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import supabase
-from routers import auth_routes, budget_lines, checklist, chat_ai, chat_polls, chats, collaborators, expenses, favourites, invitations, itinerary, itinerary_review, leave, options, planning, replan, trips, users, voice, routes, push_routes
+from routers import auth_routes, budget_lines, checklist, chat_ai, chat_polls, chats, collaborators, expenses, favourites, invitations, itinerary, itinerary_review, leave, options, planning, replan, trips, users, voice, routes, push_routes, currency
 
 app = FastAPI(title="Annual Leave API")
 
@@ -20,6 +20,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_routes.router)
+app.include_router(currency.router)
 app.include_router(users.router)
 app.include_router(trips.router)
 app.include_router(invitations.router)

@@ -18,6 +18,7 @@ router = APIRouter(prefix="/api/replan/{trip_id}", tags=["replan"])
 LATEST_END = 23 * 60 + 30
 INDOOR = "entertainment.museum,entertainment.culture,entertainment.aquarium,entertainment.planetarium,entertainment.cinema,commercial.shopping_mall,leisure.spa"
 INDOOR_SAFE = "entertainment.museum,entertainment.culture,commercial.shopping_mall"
+SIGHTS = "tourism.sights,tourism.attraction,entertainment.museum,entertainment.culture,leisure.park,natural"
 
 
 # ---------------------------------------------------------------- helpers
@@ -276,6 +277,8 @@ def _candidates(reason: str, centre_text: str, centre: tuple[float, float], cuis
     for radius in (1500, 3000, 6000, 12000, 25000):
         if reason == "closed":
             places = fetch_places(centre_text, "catering.restaurant,catering.cafe", radius, 60)
+        elif reason == "attraction":
+            places = fetch_places(centre_text, SIGHTS, radius, 60)
         else:
             try:
                 places = fetch_places(centre_text, INDOOR, radius, 60)
@@ -294,7 +297,10 @@ def _candidates(reason: str, centre_text: str, centre: tuple[float, float], cuis
             else:
                 j = attraction_json(p, city, {})
                 tag = (j["tags"] or [""])[0]
-                out.append({"id": j["id"], "title": j["title"], "category": tag or "Indoor attraction", "area": j["location"], "hours": j["opening_hours"], "dist": d, "same": False, "minutes": j["visit_duration_minutes"] or 60})
+                # a closed attraction: same kind of place (museum for museum, temple for temple...) comes first
+                kind = cuisine.lower()
+                same = reason == "attraction" and bool(kind) and any(kind in t.lower() or t.lower() in kind for t in j["tags"])
+                out.append({"id": j["id"], "title": j["title"], "category": tag or ("Attraction" if reason == "attraction" else "Indoor attraction"), "area": j["location"], "hours": j["opening_hours"], "dist": d, "same": same, "minutes": j["visit_duration_minutes"] or 60})
         if len(out) >= 4:
             break
     out.sort(key=lambda c: (not c["same"], c["dist"]))
@@ -306,9 +312,13 @@ def _schema() -> dict:
 
 
 def _prompt(reason: str, item: dict, city: str, cands: list[dict], prefs: list[str], today: list[str], rules: str = "") -> str:
-    need = ("The outdoor activity cannot happen because of bad weather. Choose INDOOR places that fit the same time slot."
-            if reason == "weather" else
-            "The restaurant turned out to be closed. Choose restaurants of a SIMILAR type (same cuisine or style, similar price) to replace it.")
+    if reason == "weather":
+        need = "The outdoor activity cannot happen because of bad weather. Choose INDOOR places that fit the same time slot."
+    elif reason == "attraction":
+        need = ("The attraction turned out to be closed. Choose attractions of a SIMILAR type (same kind of place and atmosphere) to replace it. "
+                "If none of the candidates is similar, choose the nearby attractions that best fit ALL the travellers' preferences together.")
+    else:
+        need = "The restaurant turned out to be closed. Choose restaurants of a SIMILAR type (same cuisine or style, similar price) to replace it."
     lines = [f"- id={c['id']} | {c['title']} | {c['category']} | {int(c['dist'])} m away | hours: {c['hours'] or 'unknown'}" for c in cands[:25]]
     return (
         f"A traveller in {city} must replace this stop: {item.get('title')} ({item.get('subtitle') or item.get('type')}). {need}\n"
@@ -369,7 +379,9 @@ def _verify_place(name: str, city: str, centre: tuple[float, float]) -> dict | N
 
 def _ai_suggestions(reason: str, item: dict, city: str, prefs: list[str], planned: list[str], centre: tuple[float, float], rules: str = "") -> list[dict]:
     """Nothing in the map data: ask the AI for new ideas that fit the preferences, keep only those the map confirms."""
-    kind = "indoor attractions or activities (suitable for rainy weather)" if reason == "weather" else "restaurants or cafes"
+    kind = ("indoor attractions or activities (suitable for rainy weather)" if reason == "weather"
+            else "attractions or sights (similar to the closed one, or otherwise fitting everyone's preferences)" if reason == "attraction"
+            else "restaurants or cafes")
     prompt = (
         f"A traveller in {city} needs a replacement for: {item.get('title')} ({item.get('subtitle') or item.get('type')}). "
         f"Suggest 5 REAL, well-known {kind} in or very near {city} that fit their preferences. "
@@ -420,19 +432,21 @@ def _option(c: dict, reason: str, slot: int | None, why: str | None) -> dict:
 class AltIn(BaseModel):
     day_number: int
     item_id: str
-    reason: str  # weather | closed
+    reason: str  # weather | closed (restaurant) | attraction (closed attraction)
 
 
 @router.post("/alternatives")
 def alternatives(trip_id: str, body: AltIn, me: str = Depends(get_current_user_id)):
     trip_id, trip = _host_trip(trip_id, me)
-    if body.reason not in ("weather", "closed"):
-        raise HTTPException(status_code=422, detail="reason must be weather or closed")
+    if body.reason not in ("weather", "closed", "attraction"):
+        raise HTTPException(status_code=422, detail="reason must be weather, closed or attraction")
     day, rows = _day(trip_id, body.day_number)
     item = _find(rows, body.item_id)
     city = (day.get("location") or trip.get("destination") or "").strip()
     centre, centre_text = _geo_point(item.get("title") or "", city)
-    cuisine = _cuisine_of(item.get("subtitle"), item.get("title")) if body.reason == "closed" else ""
+    cuisine = _cuisine_of(item.get("subtitle"), item.get("title")) if body.reason in ("closed", "attraction") else ""
+    if body.reason == "attraction":  # the subtitle of a sight is "City · Kind"; keep only the kind
+        cuisine = "" if cuisine.lower() == city.split(",")[0].strip().lower() else cuisine
     planned = {str(r.get("title") or "").strip().lower() for r in rows}
     s, e = mins(item.get("time_start")), mins(item.get("time_end"))
     slot = (e - s) if s is not None and e is not None and e > s else None
@@ -470,7 +484,12 @@ def alternatives(trip_id: str, body: AltIn, me: str = Depends(get_current_user_i
         chosen += [c for c in cands if c not in chosen][: 4 - len(chosen)]
     options = [_option(c, body.reason, slot, why.get(c["id"])) for c in chosen]
     similar = body.reason == "weather" or any(c.get("same") for c in chosen)
-    note = "" if similar else "No restaurant of the same type is open nearby, so these are other nearby places that fit your preferences."
+    if similar:
+        note = ""
+    elif body.reason == "attraction":
+        note = "No similar attraction is listed nearby, so these are other nearby places that fit everyone's preferences."
+    else:
+        note = "No restaurant of the same type is open nearby, so these are other nearby places that fit your preferences."
     return {"item": {"id": body.item_id, "title": item.get("title"), "subtitle": item.get("subtitle")},
             "match": "similar" if similar else "other", "note": note, "options": options}
 

@@ -16,13 +16,14 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor, wait
 from html import unescape
 from urllib.parse import urljoin, urlparse
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+import estimates
 import gemini
 from auth import get_current_user_id
 from database import supabase
@@ -732,6 +733,27 @@ def city_image(city: str, me: str = Depends(get_current_user_id)):
     return {"image_url": url}
 
 
+def with_estimates(items: list[dict], kind: str, city: str, name_key: str) -> list[dict]:
+    """Adds Gemini's estimated price: attractions get `price` ("Free"/"About RM45") and `estimated_cost`; hotels get a new
+    `price_per_night_formatted` and `estimated_cost` (per night). When the AI is unavailable the old star-based hotel price stays."""
+    got = estimates.estimate(kind, city, [i.get(name_key, "") for i in items])
+    for i in items:
+        v = got.get(i.get(name_key, ""))
+        if v is None:
+            if kind == "hotel":
+                m = re.search(r"(\d+)", i.get("price_per_night_formatted", ""))
+                i["estimated_cost"] = float(m.group(1)) if m else 0.0
+            else:
+                i["estimated_cost"] = 0.0 if i.get("price") == "Free" else -1.0
+            continue
+        i["estimated_cost"] = v
+        if kind == "attraction":
+            i["price"] = estimates.fmt(kind, v)
+        else:
+            i["price_per_night_formatted"] = f"RM{round(v)}/nt"
+    return items
+
+
 @router.get("/attractions")
 def attractions(city: str, q: str = "", me: str = Depends(get_current_user_id)):
     """Sights for the trip's city (RecommendationService.getRecommendedAttractions)."""
@@ -745,7 +767,8 @@ def attractions(city: str, q: str = "", me: str = Depends(get_current_user_id)):
     chosen = _ranked(places, 30)
     wiki = _enrich(chosen)
     items = [attraction_json(p, city, wiki.get(p.get("place_id", ""), {})) for p in chosen]
-    return drop_closed(english_names(add_photos(items, chosen, "attraction"), "title"), city, "title")
+    items = drop_closed(english_names(add_photos(items, chosen, "attraction"), "title"), city, "title")
+    return with_estimates(items, "attraction", city, "title")
 
 
 def _my_trip(trip_id: str | None, me: str) -> str | None:
@@ -885,7 +908,8 @@ def hotels(city: str, q: str = "", trip_id: str = "", me: str = Depends(get_curr
         chosen = (close if len(close) >= 6 else pool)[:25]
     else:
         chosen = _ranked(places, 25)
-    return drop_closed(english_names(add_photos([hotel_json(p, city) for p in chosen], chosen, "hotel"), "name"), city, "name")
+    items = drop_closed(english_names(add_photos([hotel_json(p, city) for p in chosen], chosen, "hotel"), "name"), city, "name")
+    return with_estimates(items, "hotel", city, "name")
 
 
 # ---------------------------------------------------------------- flights
@@ -977,6 +1001,58 @@ def flights_from_ai(raw, origin_city, origin, dest_city, dest, day: date) -> lis
     return flights
 
 
+def _date_price_schema() -> dict:
+    s, n = {"type": "STRING"}, {"type": "NUMBER"}
+    return {"type": "OBJECT", "properties": {"prices": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"date": s, "price_myr": n}, "required": ["date", "price_myr"]}}}, "required": ["prices"]}
+
+
+def _date_prices(oc: str, o: str, dc: str, d: str, dates: list[date], base_day: date, base_price: float) -> dict[str, float]:
+    """Estimated cheapest economy round-trip price (MYR) for leaving on each date. {} when the AI is unavailable."""
+    prompt = (
+        f"Estimate the cheapest typical economy round-trip price for ONE adult from {oc} ({o}) to {dc} ({d}), in Malaysian Ringgit, "
+        f"for each departure date below. For {base_day.isoformat()} the cheapest typical price is about RM{round(base_price)}. "
+        "Weekends, public holidays and school holidays are usually dearer, mid-week dates cheaper. These are estimates, not live prices.\n"
+        "Dates: " + ", ".join(x.isoformat() for x in dates) + "\n"
+        'Answer with JSON only: {"prices": [{"date": "2026-12-19", "price_myr": 1850}]}'
+    )
+    try:
+        raw = gemini.generate_json(prompt, schema=_date_price_schema(), temperature=0.3, fast=True, max_tokens=600)
+    except gemini.GeminiError as e:
+        print(f"[flights] date prices unavailable: {e.message}")
+        return {}
+    out: dict[str, float] = {}
+    for r in (raw.get("prices") if isinstance(raw, dict) else None) or []:
+        if isinstance(r, dict) and _num(r.get("price_myr")) > 0:
+            out[str(r.get("date") or "").strip()] = _num(r["price_myr"])
+    return out
+
+
+def _flight_date_chips(oc, o, dc, d, day: date, cheapest_text: str, with_neighbours: bool) -> list[dict]:
+    def chip(x: date, price: str, selected: bool) -> dict:
+        return {"date_string": f"{x.strftime('%a')}, {x.day} {x.strftime('%b')}", "price_formatted": price, "is_selected": selected, "date": x.isoformat(), "is_cheapest": False}
+    base = _num(re.sub(r"[^0-9.]", "", cheapest_text))
+    chips = [chip(day, cheapest_text, True)]
+    if with_neighbours and day >= date.today() and base > 0:
+        around = [day + timedelta(days=i) for i in range(-3, 4) if i != 0 and day + timedelta(days=i) >= date.today()]
+        key = ("flightdates", o, d, day.isoformat())
+        prices = _cached(key)
+        if prices is None:
+            prices = _date_prices(oc, o, dc, d, around, day, base)
+            if prices:
+                _store(key, prices)
+        chips = []
+        for x in sorted(around + [day]):
+            if x == day:
+                chips.append(chip(x, cheapest_text, True))
+            elif prices.get(x.isoformat()):
+                chips.append(chip(x, f"RM{round(prices[x.isoformat()])}", False))
+        if len(chips) > 1:
+            low = min(_num(re.sub(r"[^0-9.]", "", c["price_formatted"])) for c in chips)
+            for c in chips:
+                c["is_cheapest"] = _num(re.sub(r"[^0-9.]", "", c["price_formatted"])) == low
+    return chips
+
+
 def _flight_day(trip_id: str | None, me: str) -> date:
     if trip_id:
         trip_id = require_uuid(trip_id, "trip id")
@@ -1060,7 +1136,7 @@ def flights(
             raise HTTPException(status_code=e.status, detail=e.message)
         result = _store(key, flights_from_ai(raw, oc, o, dc, d, day))
     cheapest = result[0]["price_formatted"]
-    chips = [{"date_string": f"{day.strftime('%a')}, {day.day} {day.strftime('%b')}", "price_formatted": cheapest, "is_selected": True}]
+    chips = _flight_date_chips(oc, o, dc, d, day, cheapest, with_neighbours=bool(trip_id))
     return {"flights": result, "date_chips": chips}
 
 

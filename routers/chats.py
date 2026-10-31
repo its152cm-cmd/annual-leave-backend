@@ -47,7 +47,7 @@ def list_chats(user_id: str = Depends(get_current_user_id)):
 
     trips = (
         supabase.table("trips")
-        .select("id,title,destination,image_url,created_at")
+        .select("id,title,destination,image_url,created_at,status")
         .in_("id", list(last_read))
         .eq("trip_type", "group")
         .execute()
@@ -96,7 +96,8 @@ def list_chats(user_id: str = Depends(get_current_user_id)):
                 "lastMessageTime": msg["created_at"] if msg else t["created_at"],
                 "unreadCount": unread[tid],
                 "avatarUrl": t["image_url"] or "",
-                "isLiveSync": True,
+                "isLiveSync": t.get("status") != "completed",
+                "tripStatus": t.get("status") or "",
             }
         )
 
